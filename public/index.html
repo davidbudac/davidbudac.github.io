@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en" ng-app="gemStore">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- The above 3 meta tags *must* come first in the head; any other head content must come *after* these tags -->
+    <title>Store</title>
+    <!-- Bootstrap --> 
+    <link href="css/bootstrap.min.css" rel="stylesheet">
+    <!-- jQuery (necessary for Bootstrap's JavaScript plugins) -->
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.11.3/jquery.min.js"></script>
+    <!-- Include all compiled plugins (below), or include individual files as needed -->
+    <script src="js/bootstrap.min.js"></script>
+    <script type="text/javascript" src="js/angular.min.js"></script>
+
+    <script src="js/angular_test.js"></script>
+  </head>
+
+  <body class="container" ng-controller="StoreController as store" ng-init="store.init()">
+  	<h1>STORE</h1>
+    <button class="btn-default" ng-click="store.addRandomItem()">Add random item</button>
+	<ul class="list-group">
+		<li class="list-group-item" ng-repeat="product in products track by $index"
+			ng-click="store.currentProductIndex = $index"
+			ng-class="{ active : store.currentProductIndex==$index }"
+		>
+			<h3> 
+				{{product.name}}
+				<em class="pull-right">{{product.price | currency}}</em>
+			</h3>
+		</li>
+	</ul>
+	<section ng-init="tab = 0" ng-show="store.currentProductIndex!=null">
+		<ul class="nav nav-tabs">
+			<li ng-class="{active:tab === 0}"> <a href ng-click="tab = 0">Description</a></li>
+			<li ng-class="{active:tab === 1}"> <a href ng-click="tab = 1">Reviews</a></li>
+			<li ng-class="{active:tab === 2}"> <a href ng-click="tab = 2">Spec</a></li>
+		</ul>
+		<div class="panel-body" ng-show="tab === 0"> 
+			Description for {{products[store.currentProductIndex].name}} is here.
+		</div>
+		<div class="panel-body" ng-show="tab === 1"> 
+			Reviews for {{products[store.currentProductIndex].name}} are here.
+		</div>
+		<div class="panel-body" ng-show="tab === 2"> 
+			Specs for {{products[store.currentProductIndex].name}} are here.
+		</div>
+	</section>
+
+  </body>
+</html>
