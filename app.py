@@ -1,296 +1,319 @@
-"""Streamlit application for analyzing Elon Musk's tweets from the past six months."""
 from __future__ import annotations
 
-import datetime as dt
-from dataclasses import dataclass
-from typing import List, Tuple
+import importlib.machinery
+import importlib.util
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
 
-import altair as alt
 import numpy as np
 import pandas as pd
-import streamlit as st
-from sklearn.decomposition import NMF
-from sklearn.feature_extraction.text import TfidfVectorizer
-from snscrape.modules import twitter
+import snscrape  # type: ignore[import-not-found]
 
 
-def _six_months_ago(today: dt.date | None = None) -> dt.date:
-    """Return the date six months before *today* (approximate 182 days)."""
-    today = today or dt.date.today()
-    return today - dt.timedelta(days=182)
+def _ensure_snscrape_py312_compat() -> None:
+    """Provide the ``find_module`` shim removed in Python 3.12+.
+
+    Older snscrape releases (including the one available on PyPI) still invoke
+    ``FileFinder.find_module`` during module discovery, but the attribute was
+    removed from the standard library in Python 3.12.  On newer interpreters the
+    import therefore raises ``AttributeError`` before we can use the scraper. To
+    keep the dependency working without vendoring a fork, install a small
+    compatibility layer that proxies the deprecated call to ``find_spec``.
+    """
+
+    if hasattr(importlib.machinery.FileFinder, "find_module"):
+        return
+
+    def _find_module(self: importlib.machinery.FileFinder, fullname: str):
+        spec = self.find_spec(fullname)
+        return None if spec is None else spec.loader
+
+    importlib.machinery.FileFinder.find_module = _find_module  # type: ignore[attr-defined]
 
 
-@dataclass
-class TweetRecord:
-    """Simplified representation of a tweet for analysis."""
-
-    tweet_id: int
-    date: dt.datetime
-    content: str
-    like_count: int
-    retweet_count: int
-    reply_count: int
-
-    @property
-    def length(self) -> int:
-        return len(self.content or "")
+_ensure_snscrape_py312_compat()
 
 
-def fetch_tweets(max_results: int = 2000) -> pd.DataFrame:
-    """Fetch Elon Musk tweets from the last six months using snscrape."""
-    since = _six_months_ago()
-    query = f"from:elonmusk since:{since.isoformat()}"
-    scraper = twitter.TwitterSearchScraper(query)
+def _import_snscrape_twitter():
+    """Import ``snscrape.modules.twitter`` with compatibility shims.
 
-    records: List[TweetRecord] = []
-    for index, tweet in enumerate(scraper.get_items()):
-        if index >= max_results:
-            break
-        if tweet.date.date() < since:
-            break
-        record = TweetRecord(
-            tweet_id=tweet.id,
-            date=tweet.date,
-            content=tweet.content,
-            like_count=tweet.likeCount,
-            retweet_count=tweet.retweetCount,
-            reply_count=tweet.replyCount,
+    ``snscrape.modules.__init__`` relies on the deprecated importer API that
+    disappeared in Python 3.12, so importing the submodule can raise
+    ``AttributeError`` even after installing the ``find_module`` shim above.
+    As a fallback we load the module manually via ``importlib`` and register it
+    inside ``sys.modules`` so the rest of the application can use it normally.
+    """
+
+    try:
+        import snscrape.modules.twitter as twitter_module  # type: ignore[import-not-found]
+    except AttributeError as exc:
+        if "find_module" not in str(exc):
+            raise
+
+        import sys
+        import types
+        from importlib.machinery import ModuleSpec
+        from pathlib import Path
+
+        modules_pkg_name = "snscrape.modules"
+        modules_pkg = sys.modules.get(modules_pkg_name)
+        modules_path = Path(snscrape.__file__).resolve().parent / "modules"
+
+        if modules_pkg is None:
+            modules_pkg = types.ModuleType(modules_pkg_name)
+            modules_pkg.__path__ = [str(modules_path)]  # type: ignore[attr-defined]
+            modules_pkg.__file__ = str(modules_path / "__init__.py")
+            modules_pkg.__package__ = modules_pkg_name
+            modules_pkg.__spec__ = ModuleSpec(modules_pkg_name, loader=None, is_package=True)
+            modules_pkg.__all__ = []  # type: ignore[attr-defined]
+            sys.modules[modules_pkg_name] = modules_pkg
+
+        spec = importlib.util.spec_from_file_location(
+            f"{modules_pkg_name}.twitter", modules_path / "twitter.py"
         )
-        records.append(record)
+        if spec is None or spec.loader is None:
+            raise ImportError("Could not load snscrape.modules.twitter") from exc
 
-    if not records:
-        return pd.DataFrame(columns=[
-            "tweet_id",
-            "date",
-            "content",
-            "like_count",
-            "retweet_count",
-            "reply_count",
-            "length",
-        ])
+        twitter_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(twitter_module)
 
-    df = pd.DataFrame([
-        {
-            "tweet_id": r.tweet_id,
-            "date": pd.to_datetime(r.date),
-            "content": r.content,
-            "like_count": r.like_count,
-            "retweet_count": r.retweet_count,
-            "reply_count": r.reply_count,
-            "length": r.length,
-        }
-        for r in records
-    ])
+        sys.modules[spec.name] = twitter_module
+        setattr(modules_pkg, "twitter", twitter_module)
+        all_attr = getattr(modules_pkg, "__all__", None)
+        if isinstance(all_attr, list) and "twitter" not in all_attr:
+            all_attr.append("twitter")
+    else:
+        return twitter_module
 
+    return twitter_module
+
+
+sntwitter = _import_snscrape_twitter()
+from flask import Flask, jsonify, render_template
+from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.feature_extraction.text import CountVectorizer
+
+app = Flask(__name__)
+logger = logging.getLogger(__name__)
+
+MAX_TWEETS = 500
+REFRESH_WINDOW_MINUTES = 30
+
+# In-memory cache to avoid repeated scrapes when the data is still fresh.
+_data_cache: Dict[str, Any] = {"data": None, "timestamp": None}
+
+
+def _clean_text(text: str) -> str:
+    """Remove URLs, mentions, hashtags (symbol only) and collapse whitespace."""
+    text_no_urls = re.sub(r"https?://\S+", "", text)
+    text_no_handles = re.sub(r"@[A-Za-z0-9_]+", "", text_no_urls)
+    text_no_hash = text_no_handles.replace("#", "")
+    return re.sub(r"\s+", " ", text_no_hash).strip()
+
+
+def fetch_tweets(limit: int = MAX_TWEETS) -> pd.DataFrame:
+    """Fetch tweets from Elon Musk for the last six months using snscrape."""
+    six_months_ago = datetime.now(timezone.utc) - timedelta(days=182)
+    query = f"from:elonmusk since:{six_months_ago.date()}"
+    tweets: List[Dict[str, Any]] = []
+
+    scraper = sntwitter.TwitterSearchScraper(query)
+    for i, tweet in enumerate(scraper.get_items()):
+        if limit and i >= limit:
+            break
+        if tweet.date < six_months_ago:
+            break
+        tweets.append(
+            {
+                "id": tweet.id,
+                "date": tweet.date,
+                "content": tweet.rawContent,
+                "like_count": tweet.likeCount,
+                "reply_count": tweet.replyCount,
+                "retweet_count": tweet.retweetCount,
+                "quote_count": tweet.quoteCount,
+                "url": tweet.url,
+            }
+        )
+
+    if not tweets:
+        raise RuntimeError("No tweets were fetched. The scraper may be rate limited.")
+
+    df = pd.DataFrame(tweets)
     df.sort_values("date", inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
 
 
-def compute_topics(texts: pd.Series, n_topics: int = 5, top_n_words: int = 10) -> Tuple[List[str], np.ndarray | None]:
-    """Generate a lightweight topic summary using TF-IDF and NMF."""
-    cleaned = texts.dropna()
-    if cleaned.empty:
-        return [], None
+def build_topics(texts: List[str], n_topics: int = 5, n_words: int = 8) -> List[Dict[str, Any]]:
+    cleaned = [_clean_text(t) for t in texts if t.strip()]
+    if len(cleaned) < 5:
+        return []
 
-    n_topics = min(n_topics, max(1, cleaned.shape[0]))
+    vectorizer = CountVectorizer(
+        stop_words="english",
+        min_df=2,
+        max_df=0.9,
+    )
+    doc_term = vectorizer.fit_transform(cleaned)
+    if doc_term.shape[1] == 0:
+        return []
 
-    vectorizer = TfidfVectorizer(stop_words="english", min_df=2)
-    try:
-        tfidf = vectorizer.fit_transform(cleaned)
-    except ValueError:
-        # Not enough unique tokens for vectorizer
-        return [], None
+    n_topics = min(n_topics, doc_term.shape[0])
+    lda = LatentDirichletAllocation(
+        n_components=n_topics,
+        learning_method="online",
+        random_state=42,
+        max_iter=10,
+    )
+    lda.fit(doc_term)
 
-    try:
-        nmf = NMF(n_components=n_topics, random_state=42)
-        topic_matrix = nmf.fit_transform(tfidf)
-    except ValueError:
-        # Fallback to a single topic if decomposition fails
-        nmf = NMF(n_components=1, random_state=42)
-        topic_matrix = nmf.fit_transform(tfidf)
-        n_topics = 1
-
+    topics: List[Dict[str, Any]] = []
     feature_names = vectorizer.get_feature_names_out()
-    topics: List[str] = []
-    for idx, topic in enumerate(nmf.components_):
-        top_indices = topic.argsort()[-top_n_words:][::-1]
-        words = [feature_names[i] for i in top_indices]
-        topics.append(", ".join(words))
+    for idx, topic in enumerate(lda.components_):
+        top_indices = topic.argsort()[::-1][:n_words]
+        top_words = [feature_names[i] for i in top_indices]
+        topics.append({"topic": idx + 1, "keywords": top_words})
 
-    assignments = None
-    if topic_matrix.size:
-        assignments = np.argmax(topic_matrix, axis=1)
-
-    return topics, assignments
+    return topics
 
 
-@st.cache_data(ttl=3600)
-def load_data(max_results: int = 2000) -> pd.DataFrame:
-    return fetch_tweets(max_results=max_results)
+def summarize_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
+    df = df.copy()
+    df["length"] = df["content"].str.len()
+    df["clean_content"] = df["content"].apply(_clean_text)
+    df["created_at"] = pd.to_datetime(df["date"], utc=True)
+    df["hour"] = df["created_at"].dt.hour
+    df["date_only"] = df["created_at"].dt.date
 
+    bins = [0, 6, 12, 18, 24]
+    labels = ["Late Night", "Morning", "Afternoon", "Evening"]
+    df["time_of_day"] = pd.cut(df["hour"], bins=bins, labels=labels, right=False, include_lowest=True)
 
-def render_overview(df: pd.DataFrame) -> None:
-    st.subheader("Dataset overview")
-    st.write(
-        "Showing tweets published by Elon Musk over the last six months "
-        "(limited to the most recent results)."
-    )
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Tweets", f"{len(df):,}")
-    if not df.empty:
-        col_b.metric("Date range", f"{df['date'].min().date()} → {df['date'].max().date()}")
-        col_c.metric("Median length", f"{int(df['length'].median())} characters")
-    else:
-        col_b.metric("Date range", "–")
-        col_c.metric("Median length", "–")
+    summary = {
+        "tweet_count": int(df.shape[0]),
+        "avg_length": float(df["length"].mean()),
+        "median_length": float(df["length"].median()),
+        "max_length": int(df["length"].max()),
+        "min_length": int(df["length"].min()),
+        "avg_likes": float(df["like_count"].mean()),
+        "avg_retweets": float(df["retweet_count"].mean()),
+    }
 
-    st.dataframe(
-        df[["date", "content", "length", "like_count", "retweet_count", "reply_count"]]
-        .rename(columns={
-            "date": "Timestamp",
-            "content": "Tweet",
-            "length": "Length",
-            "like_count": "Likes",
-            "retweet_count": "Retweets",
-            "reply_count": "Replies",
-        })
-        .tail(25),
-        use_container_width=True,
-    )
-
-
-def render_time_vs_length(df: pd.DataFrame) -> None:
-    st.subheader("Tweet timing vs. length")
-    if df.empty:
-        st.info("No tweets available to visualise.")
-        return
-
-    scatter_chart = (
-        alt.Chart(df)
-        .mark_circle(size=60, opacity=0.6)
-        .encode(
-            x=alt.X("date:T", title="Tweet time"),
-            y=alt.Y("length:Q", title="Tweet length (characters)"),
-            tooltip=["date:T", "length:Q", "like_count:Q", "retweet_count:Q"],
-            color=alt.Color("like_count:Q", scale=alt.Scale(scheme="blues"), title="Likes"),
-        )
-        .interactive()
-    )
-    st.altair_chart(scatter_chart, use_container_width=True)
-
-
-def render_time_of_day(df: pd.DataFrame) -> None:
-    st.subheader("Time-of-day patterns")
-    if df.empty:
-        st.info("No data to display.")
-        return
-
-    df_hours = df.copy()
-    df_hours["hour"] = df_hours["date"].dt.hour
-
-    heatmap = (
-        alt.Chart(df_hours)
-        .mark_bar()
-        .encode(
-            x=alt.X("hour:O", title="Hour of day"),
-            y=alt.Y("count():Q", title="Number of tweets"),
-            tooltip=["hour:O", "count():Q"],
-        )
-    )
-    st.altair_chart(heatmap, use_container_width=True)
-
-
-def render_daily_stats(df: pd.DataFrame) -> None:
-    st.subheader("Daily activity summary")
-    if df.empty:
-        st.info("No data to display.")
-        return
+    scatter = {
+        "timestamps": df["created_at"].dt.tz_convert("UTC").astype(str).tolist(),
+        "lengths": df["length"].tolist(),
+        "hover_text": [
+            f"{row.created_at:%Y-%m-%d %H:%M} UTC | {row.length} chars" for row in df.itertuples()
+        ],
+    }
 
     daily = (
-        df.assign(date_only=df["date"].dt.date)
-        .groupby("date_only")
+        df.groupby("date_only")
         .agg(
-            tweets=("tweet_id", "count"),
+            tweet_count=("id", "count"),
             avg_length=("length", "mean"),
-            likes=("like_count", "sum"),
-            retweets=("retweet_count", "sum"),
+            total_likes=("like_count", "sum"),
         )
         .reset_index()
     )
+    daily["date_only"] = daily["date_only"].astype(str)
 
-    chart = (
-        alt.Chart(daily)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("date_only:T", title="Date"),
-            y=alt.Y("tweets:Q", title="Tweets"),
-            tooltip=["date_only:T", "tweets:Q", "avg_length:Q", "likes:Q", "retweets:Q"],
-        )
+    hourly = (
+        df.groupby("hour")
+        .agg(tweet_count=("id", "count"), avg_length=("length", "mean"))
+        .reset_index()
+        .sort_values("hour")
     )
-    st.altair_chart(chart, use_container_width=True)
 
-    st.dataframe(daily, use_container_width=True)
+    hourly["hour"] = hourly["hour"].astype(int)
+
+    time_of_day = (
+        df.groupby("time_of_day")
+        .agg(tweet_count=("id", "count"), avg_length=("length", "mean"))
+        .reset_index()
+    )
+
+    time_of_day["time_of_day"] = time_of_day["time_of_day"].astype(str)
+
+    hist_counts, hist_edges = np.histogram(df["length"], bins=15)
+    hist_centers = ((hist_edges[:-1] + hist_edges[1:]) / 2).tolist()
+
+    topics = build_topics(df["clean_content"].tolist())
+
+    top_examples = (
+        df.sort_values("like_count", ascending=False)
+        .head(5)[["created_at", "content", "like_count", "retweet_count", "reply_count", "url"]]
+    )
+    top_examples["created_at"] = top_examples["created_at"].dt.strftime("%Y-%m-%d %H:%M UTC")
+
+    dataset = {
+        "summary": summary,
+        "scatter": scatter,
+        "daily": daily.to_dict(orient="list"),
+        "hourly": hourly.to_dict(orient="list"),
+        "time_of_day": time_of_day.to_dict(orient="list"),
+        "length_hist": {
+            "counts": hist_counts.tolist(),
+            "bins": hist_centers,
+        },
+        "topics": topics,
+        "top_examples": top_examples.to_dict(orient="records"),
+    }
+    return dataset
 
 
-def render_topics(df: pd.DataFrame) -> None:
-    st.subheader("Topical overview")
-    if df.empty:
-        st.info("No tweets to analyse.")
-        return
+def load_data(force_refresh: bool = False) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    if not force_refresh and _data_cache["data"] is not None:
+        ts = _data_cache["timestamp"]
+        if ts and now - ts < timedelta(minutes=REFRESH_WINDOW_MINUTES):
+            return _data_cache["data"]
 
-    topics, assignments = compute_topics(df["content"], n_topics=5)
-    if not topics:
-        st.info("Not enough textual variety to compute topics.")
-        return
+    try:
+        df = fetch_tweets()
+        dataset = summarize_dataframe(df)
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.exception("Failed to fetch tweets: %s", exc)
+        if _data_cache["data"] is not None and not force_refresh:
+            return _data_cache["data"]
+        raise RuntimeError(
+            "Unable to retrieve tweets at the moment. Try again later or use cached data if available."
+        ) from exc
 
-    st.write("Identified themes based on TF-IDF keywords:")
-    for idx, topic in enumerate(topics, start=1):
-        st.markdown(f"**Topic {idx}:** {topic}")
-
-    if assignments is not None and assignments.size == len(df):
-        df_topics = df.copy()
-        df_topics["topic"] = assignments
-        topic_counts = (
-            df_topics.groupby("topic").agg(
-                tweets=("tweet_id", "count"),
-                avg_length=("length", "mean"),
-                likes=("like_count", "mean"),
-            )
-        )
-        st.dataframe(topic_counts, use_container_width=True)
+    _data_cache["data"] = dataset
+    _data_cache["timestamp"] = now
+    return dataset
 
 
-def main() -> None:
-    st.set_page_config(page_title="Elon Musk Twitter Insights", layout="wide")
-    st.title("Elon Musk Twitter Insights")
-    st.caption("Interactive exploration of recent tweet activity.")
+@app.route("/")
+def index() -> str:
+    return render_template("index.html")
 
-    st.sidebar.header("Controls")
-    max_results = st.sidebar.slider("Max tweets to load", min_value=200, max_value=3000, value=1500, step=100)
 
-    if st.sidebar.button("Refresh data", help="Fetch the latest tweets and recompute analysis"):
-        load_data.clear()
+@app.route("/data")
+def get_data():
+    try:
+        dataset = load_data()
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    timestamp = _data_cache["timestamp"]
+    iso_ts = timestamp.isoformat() if timestamp else None
+    return jsonify({"data": dataset, "last_updated": iso_ts})
 
-    with st.spinner("Fetching tweets..."):
-        df = load_data(max_results=max_results)
 
-    if df.empty:
-        st.warning(
-            "No tweets were retrieved. Try increasing the tweet limit or refreshing the data."
-        )
-        return
-
-    render_overview(df)
-    st.markdown("---")
-    render_time_vs_length(df)
-    st.markdown("---")
-    render_time_of_day(df)
-    st.markdown("---")
-    render_daily_stats(df)
-    st.markdown("---")
-    render_topics(df)
+@app.route("/refresh", methods=["POST"])
+def refresh_data():
+    try:
+        dataset = load_data(force_refresh=True)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    timestamp = _data_cache["timestamp"]
+    iso_ts = timestamp.isoformat() if timestamp else None
+    return jsonify({"status": "ok", "data": dataset, "last_updated": iso_ts})
 
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=5000, debug=True)
