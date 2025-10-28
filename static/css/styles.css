@@ -1,0 +1,20 @@
+body {
+  min-height: 100vh;
+}
+
+.chart {
+  min-height: 320px;
+}
+
+#top-tweets-table td {
+  max-width: 320px;
+}
+
+#top-tweets-table td a {
+  text-decoration: none;
+  color: inherit;
+}
+
+#top-tweets-table td a:hover {
+  text-decoration: underline;
+}
