@@ -2,19 +2,37 @@ body {
   min-height: 100vh;
 }
 
-.chart {
-  min-height: 320px;
+#wallet-form.is-active {
+  border: 1px solid rgba(13, 110, 253, 0.25);
+  box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.1);
 }
 
-#top-tweets-table td {
-  max-width: 320px;
+.wallet-card {
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  border-radius: 1rem;
 }
 
-#top-tweets-table td a {
-  text-decoration: none;
-  color: inherit;
+.wallet-card .card-header {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(255, 255, 255, 0.85);
 }
 
-#top-tweets-table td a:hover {
-  text-decoration: underline;
+.wallet-card .card-body {
+  background: #fff;
+}
+
+.wallet-card table th,
+.wallet-card table td {
+  white-space: nowrap;
+}
+
+.wallet-card table th:first-child,
+.wallet-card table td:first-child {
+  white-space: normal;
+}
+
+pre {
+  max-height: 280px;
+  overflow: auto;
+  font-size: 0.75rem;
 }

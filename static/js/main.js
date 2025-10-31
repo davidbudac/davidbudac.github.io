@@ -1,23 +1,29 @@
-const summaryCardsContainer = document.getElementById('summary-cards');
-const topicsList = document.getElementById('topics-list');
-const topTweetsTable = document.querySelector('#top-tweets-table tbody');
-const lastUpdated = document.getElementById('last-updated');
+const form = document.getElementById('wallet-form');
+const addressesInput = document.getElementById('wallet-input');
+const resultsContainer = document.getElementById('results');
 const alertContainer = document.getElementById('alert-container');
-const refreshButton = document.getElementById('refresh-btn');
+const lastUpdatedElement = document.getElementById('last-updated');
+const refreshSelect = document.getElementById('refresh-interval');
+const stopButton = document.getElementById('stop-btn');
 
-async function fetchData(endpoint = '/data', options = {}) {
-  try {
-    const response = await fetch(endpoint, options);
-    const payload = await response.json();
-    if (!response.ok) {
-      const message = payload?.error || `Request failed with status ${response.status}`;
-      throw new Error(message);
-    }
-    return payload;
-  } catch (error) {
-    showAlert(`Unable to load data: ${error.message}`, 'danger');
-    throw error;
+let activeAddresses = [];
+let refreshTimerId = null;
+let isLoading = false;
+
+const ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/;
+
+function parseAddresses(raw) {
+  if (!raw) {
+    return [];
   }
+  return Array.from(
+    new Set(
+      raw
+        .split(/[\s,\n\r]+/)
+        .map((entry) => entry.trim().toLowerCase())
+        .filter((entry) => entry.length > 0)
+    )
+  );
 }
 
 function showAlert(message, type = 'info') {
@@ -32,223 +38,294 @@ function clearAlert() {
   alertContainer.innerHTML = '';
 }
 
-function renderSummary(summary) {
-  const items = [
-    { label: 'Tweets analysed', value: summary.tweet_count.toLocaleString() },
-    { label: 'Average length', value: `${summary.avg_length.toFixed(1)} chars` },
-    { label: 'Median length', value: `${summary.median_length.toFixed(0)} chars` },
-    { label: 'Average likes', value: summary.avg_likes.toFixed(0) },
-    { label: 'Average retweets', value: summary.avg_retweets.toFixed(0) },
-    { label: 'Length range', value: `${summary.min_length} – ${summary.max_length} chars` },
-  ];
-
-  summaryCardsContainer.innerHTML = items
-    .map(
-      (item) => `
-        <div class="col-12 col-md-4 col-xl-2 mb-3">
-          <div class="card h-100">
-            <div class="card-body">
-              <p class="text-muted small mb-1">${item.label}</p>
-              <p class="fw-semibold h5 mb-0">${item.value}</p>
-            </div>
-          </div>
-        </div>`
-    )
-    .join('');
-}
-
-function renderScatter(scatter) {
-  const trace = {
-    x: scatter.timestamps,
-    y: scatter.lengths,
-    type: 'scatter',
-    mode: 'markers',
-    marker: {
-      color: '#0d6efd',
-      size: 8,
-      opacity: 0.7,
-    },
-    text: scatter.hover_text,
-    hovertemplate: '%{text}<extra></extra>',
-  };
-
-  const layout = {
-    margin: { t: 10, r: 10, b: 40, l: 50 },
-    xaxis: { title: 'Date' },
-    yaxis: { title: 'Tweet length (characters)' },
-  };
-
-  Plotly.newPlot('length-time-chart', [trace], layout, { responsive: true });
-}
-
-function renderDaily(daily) {
-  const trace = {
-    x: daily.date_only,
-    y: daily.tweet_count,
-    type: 'bar',
-    marker: { color: '#6610f2' },
-    hovertemplate: '%{x}<br>Tweets: %{y}<extra></extra>',
-  };
-
-  const secondary = {
-    x: daily.date_only,
-    y: daily.avg_length,
-    yaxis: 'y2',
-    type: 'scatter',
-    mode: 'lines',
-    name: 'Avg length',
-    marker: { color: '#20c997' },
-    hovertemplate: 'Avg length: %{y:.0f}<extra></extra>',
-  };
-
-  const layout = {
-    margin: { t: 10, r: 50, b: 60, l: 50 },
-    xaxis: { title: 'Date' },
-    yaxis: { title: 'Tweet count' },
-    yaxis2: {
-      overlaying: 'y',
-      side: 'right',
-      title: 'Average length',
-    },
-    legend: { orientation: 'h', y: -0.2 },
-  };
-
-  Plotly.newPlot('daily-chart', [trace, secondary], layout, { responsive: true });
-}
-
-function renderHourly(hourly) {
-  const trace = {
-    x: hourly.hour,
-    y: hourly.tweet_count,
-    type: 'bar',
-    marker: { color: '#198754' },
-    hovertemplate: 'Hour %{x}:00<br>Tweets: %{y}<extra></extra>',
-  };
-
-  const layout = {
-    margin: { t: 10, r: 10, b: 40, l: 50 },
-    xaxis: { title: 'Hour of day (UTC)' },
-    yaxis: { title: 'Tweet count' },
-  };
-
-  Plotly.newPlot('hourly-chart', [trace], layout, { responsive: true });
-}
-
-function renderHistogram(hist) {
-  const trace = {
-    x: hist.bins,
-    y: hist.counts,
-    type: 'bar',
-    marker: { color: '#fd7e14' },
-    hovertemplate: 'Length: %{x}<br>Count: %{y}<extra></extra>',
-  };
-
-  const layout = {
-    bargap: 0,
-    margin: { t: 10, r: 10, b: 40, l: 50 },
-    xaxis: { title: 'Tweet length (characters)' },
-    yaxis: { title: 'Tweet count' },
-  };
-
-  Plotly.newPlot('length-hist-chart', [trace], layout, { responsive: true });
-}
-
-function renderTimeOfDay(timeOfDay) {
-  const trace = {
-    x: timeOfDay.time_of_day,
-    y: timeOfDay.tweet_count,
-    type: 'bar',
-    marker: { color: '#6f42c1' },
-    hovertemplate: '%{x}<br>Tweets: %{y}<extra></extra>',
-  };
-
-  const layout = {
-    margin: { t: 10, r: 10, b: 40, l: 50 },
-    xaxis: { title: 'Time of day' },
-    yaxis: { title: 'Tweet count' },
-  };
-
-  Plotly.newPlot('time-of-day-chart', [trace], layout, { responsive: true });
-}
-
-function renderTopics(topics) {
-  if (!topics || topics.length === 0) {
-    topicsList.innerHTML = '<li class="list-group-item">Not enough data to detect topics.</li>';
-    return;
+function formatNumber(value, digits = 4) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return '—';
   }
-
-  topicsList.innerHTML = topics
-    .map(
-      (topic) => `
-        <li class="list-group-item">
-          <strong>Topic ${topic.topic}:</strong>
-          <span class="text-muted">${topic.keywords.join(', ')}</span>
-        </li>`
-    )
-    .join('');
+  const number = Number(value);
+  if (Math.abs(number) >= 1000) {
+    return number.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  }
+  return number.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: digits });
 }
 
-function renderTopTweets(tweets) {
-  topTweetsTable.innerHTML = tweets
-    .map(
-      (tweet) => `
-        <tr>
-          <td>${tweet.created_at}</td>
-          <td><a href="${tweet.url}" target="_blank" rel="noopener noreferrer">${tweet.content}</a></td>
-          <td>${tweet.like_count.toLocaleString()}</td>
-          <td>${tweet.retweet_count.toLocaleString()}</td>
-          <td>${tweet.reply_count.toLocaleString()}</td>
-        </tr>`
-    )
-    .join('');
-}
-
-function updateLastUpdated(timestamp) {
+function formatTimestamp(timestamp) {
   if (!timestamp) {
-    lastUpdated.textContent = '';
-    return;
+    return '—';
   }
   const date = new Date(timestamp);
-  lastUpdated.textContent = `Last updated ${date.toLocaleString()}`;
+  if (Number.isNaN(date.getTime())) {
+    return timestamp;
+  }
+  return `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
 }
 
-function renderAll(data, timestamp) {
-  renderSummary(data.summary);
-  renderScatter(data.scatter);
-  renderDaily(data.daily);
-  renderHourly(data.hourly);
-  renderHistogram(data.length_hist);
-  renderTimeOfDay(data.time_of_day);
-  renderTopics(data.topics);
-  renderTopTweets(data.top_examples);
-  updateLastUpdated(timestamp);
+function buildMarketLink(slug) {
+  if (!slug) {
+    return null;
+  }
+  if (slug.startsWith('http://') || slug.startsWith('https://')) {
+    return slug;
+  }
+  return `https://polymarket.com/event/${slug}`;
 }
 
-async function initialise() {
-  clearAlert();
-  try {
-    const response = await fetchData();
-    renderAll(response.data, response.last_updated);
-  } catch (error) {
-    console.error(error);
-    showAlert('Unable to load Elon Musk tweet analytics right now. Please try again later.', 'danger');
+function renderPositions(positions) {
+  if (!positions || positions.length === 0) {
+    return '<p class="text-muted mb-0">No open positions on Polymarket.</p>';
+  }
+
+  const rows = positions
+    .map((position) => {
+      const link = buildMarketLink(position.market_slug);
+      const question = position.market_question || 'Unknown market';
+      const marketCell = link
+        ? `<a href="${link}" target="_blank" rel="noopener noreferrer">${question}</a>`
+        : question;
+
+      return `
+        <tr>
+          <td>${marketCell}</td>
+          <td>${position.outcome ?? '—'}</td>
+          <td>${formatNumber(position.net_position)}</td>
+          <td>${formatNumber(position.average_price)}</td>
+          <td>${formatNumber(position.last_price)}</td>
+          <td>${formatNumber(position.value, 2)}</td>
+        </tr>`;
+    })
+    .join('');
+
+  return `
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="table-light">
+          <tr>
+            <th scope="col">Market</th>
+            <th scope="col">Outcome</th>
+            <th scope="col">Net position</th>
+            <th scope="col">Average price</th>
+            <th scope="col">Last price</th>
+            <th scope="col">Mark to market</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function renderOrders(orders) {
+  if (!orders || orders.length === 0) {
+    return '<p class="text-muted mb-0">No open limit orders.</p>';
+  }
+
+  const rows = orders
+    .map((order) => {
+      const link = buildMarketLink(order.market_slug);
+      const question = order.market_question || 'Unknown market';
+      const marketCell = link
+        ? `<a href="${link}" target="_blank" rel="noopener noreferrer">${question}</a>`
+        : question;
+
+      return `
+        <tr>
+          <td>${marketCell}</td>
+          <td>${order.outcome ?? '—'}</td>
+          <td>${order.side ?? '—'}</td>
+          <td>${order.order_type ?? '—'}</td>
+          <td>${formatNumber(order.price)}</td>
+          <td>${formatNumber(order.size)}</td>
+          <td>${formatNumber(order.remaining_size)}</td>
+          <td>${order.status ?? '—'}</td>
+          <td>${formatTimestamp(order.created_at)}</td>
+        </tr>`;
+    })
+    .join('');
+
+  return `
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="table-light">
+          <tr>
+            <th scope="col">Market</th>
+            <th scope="col">Outcome</th>
+            <th scope="col">Side</th>
+            <th scope="col">Type</th>
+            <th scope="col">Price</th>
+            <th scope="col">Size</th>
+            <th scope="col">Remaining</th>
+            <th scope="col">Status</th>
+            <th scope="col">Placed</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function renderRawData(rawPositions, rawOrders) {
+  const content = {
+    positions: rawPositions,
+    orders: rawOrders,
+  };
+  return `
+    <details class="mt-3 small text-muted">
+      <summary>Raw API payload</summary>
+      <pre class="mt-2 bg-body-secondary rounded p-2">${JSON.stringify(content, null, 2)}</pre>
+    </details>`;
+}
+
+function renderWallet(result) {
+  const statusBadge = result.error
+    ? '<span class="badge bg-danger-subtle text-danger">API error</span>'
+    : '<span class="badge bg-success-subtle text-success">Live</span>';
+
+  const header = `
+    <div class="d-flex flex-column flex-lg-row justify-content-between align-items-lg-center gap-2">
+      <div>
+        <h2 class="h5 mb-0">${result.address}</h2>
+        <div class="small text-muted">Tracking open positions and limit orders</div>
+      </div>
+      ${statusBadge}
+    </div>`;
+
+  let body = '';
+  if (result.error) {
+    body = `<p class="text-danger mb-0">${result.error}</p>`;
+  } else {
+    body = `
+      <div class="mb-4">
+        <h3 class="h6 mb-2">Positions</h3>
+        ${renderPositions(result.positions)}
+      </div>
+      <div>
+        <h3 class="h6 mb-2">Open limit orders</h3>
+        ${renderOrders(result.open_orders)}
+      </div>
+      ${renderRawData(result.positions?.map((p) => p.raw) ?? [], result.open_orders?.map((o) => o.raw) ?? [])}
+    `;
+  }
+
+  return `
+    <article class="card shadow-sm wallet-card">
+      <div class="card-header bg-white border-bottom-0">
+        ${header}
+      </div>
+      <div class="card-body">
+        ${body}
+      </div>
+    </article>`;
+}
+
+function renderResults(snapshot) {
+  if (!snapshot || !snapshot.results) {
+    resultsContainer.innerHTML = '';
+    lastUpdatedElement.textContent = 'Never';
+    return;
+  }
+
+  resultsContainer.innerHTML = snapshot.results.map((result) => renderWallet(result)).join('');
+
+  if (snapshot.requested_at) {
+    lastUpdatedElement.textContent = formatTimestamp(snapshot.requested_at);
+  } else {
+    lastUpdatedElement.textContent = new Date().toLocaleString();
   }
 }
 
-refreshButton.addEventListener('click', async () => {
-  refreshButton.disabled = true;
-  refreshButton.textContent = 'Refreshing…';
-  clearAlert();
+async function fetchSnapshot(addresses) {
+  const response = await fetch('/api/wallets', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ addresses }),
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = payload?.error || `Request failed with status ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+async function refresh() {
+  if (isLoading || activeAddresses.length === 0) {
+    return;
+  }
+  isLoading = true;
+  showAlert('Refreshing wallets…', 'info');
   try {
-    const response = await fetchData('/refresh', { method: 'POST' });
-    renderAll(response.data, response.last_updated);
-    showAlert('Data refreshed successfully.', 'success');
+    const snapshot = await fetchSnapshot(activeAddresses);
+    clearAlert();
+    renderResults(snapshot);
   } catch (error) {
-    console.error(error);
+    showAlert(error.message, 'danger');
   } finally {
-    refreshButton.disabled = false;
-    refreshButton.textContent = 'Refresh data';
+    isLoading = false;
   }
+}
+
+function setMonitoringState(running) {
+  stopButton.disabled = !running;
+  if (running) {
+    form.classList.add('is-active');
+  } else {
+    form.classList.remove('is-active');
+    lastUpdatedElement.textContent = 'Never';
+    resultsContainer.innerHTML = '';
+  }
+}
+
+function stopMonitoring() {
+  if (refreshTimerId) {
+    clearInterval(refreshTimerId);
+    refreshTimerId = null;
+  }
+  activeAddresses = [];
+  setMonitoringState(false);
+  clearAlert();
+}
+
+async function startMonitoring(addresses) {
+  activeAddresses = addresses;
+  setMonitoringState(true);
+  await refresh();
+
+  const intervalSeconds = Number(refreshSelect.value || '20');
+  if (refreshTimerId) {
+    clearInterval(refreshTimerId);
+  }
+  refreshTimerId = setInterval(refresh, intervalSeconds * 1000);
+}
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const addresses = parseAddresses(addressesInput.value);
+
+  if (addresses.length === 0) {
+    showAlert('Please provide at least one Polygon wallet address.', 'warning');
+    return;
+  }
+
+  const invalid = addresses.filter((address) => !ADDRESS_REGEX.test(address));
+  if (invalid.length > 0) {
+    showAlert(`Invalid wallet addresses detected: ${invalid.join(', ')}`, 'danger');
+    return;
+  }
+
+  clearAlert();
+  await startMonitoring(addresses);
 });
 
-window.addEventListener('DOMContentLoaded', initialise);
+stopButton.addEventListener('click', () => {
+  stopMonitoring();
+});
+
+window.addEventListener('beforeunload', () => {
+  if (refreshTimerId) {
+    clearInterval(refreshTimerId);
+  }
+});
