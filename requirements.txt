@@ -1,6 +1,2 @@
 Flask==3.0.2
-pandas==2.2.2
-plotly==5.20.0
-snscrape==0.7.0.20230622
-scikit-learn==1.4.2
-numpy==1.26.4
+requests==2.31.0

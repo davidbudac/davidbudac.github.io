@@ -1,291 +1,308 @@
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import logging
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-import numpy as np
-import pandas as pd
-import snscrape  # type: ignore[import-not-found]
-
-
-def _ensure_snscrape_py312_compat() -> None:
-    """Provide the ``find_module`` shim removed in Python 3.12+.
-
-    Older snscrape releases (including the one available on PyPI) still invoke
-    ``FileFinder.find_module`` during module discovery, but the attribute was
-    removed from the standard library in Python 3.12.  On newer interpreters the
-    import therefore raises ``AttributeError`` before we can use the scraper. To
-    keep the dependency working without vendoring a fork, install a small
-    compatibility layer that proxies the deprecated call to ``find_spec``.
-    """
-
-    if hasattr(importlib.machinery.FileFinder, "find_module"):
-        return
-
-    def _find_module(self: importlib.machinery.FileFinder, fullname: str):
-        spec = self.find_spec(fullname)
-        return None if spec is None else spec.loader
-
-    importlib.machinery.FileFinder.find_module = _find_module  # type: ignore[attr-defined]
-
-
-_ensure_snscrape_py312_compat()
-
-
-def _import_snscrape_twitter():
-    """Import ``snscrape.modules.twitter`` with compatibility shims.
-
-    ``snscrape.modules.__init__`` relies on the deprecated importer API that
-    disappeared in Python 3.12, so importing the submodule can raise
-    ``AttributeError`` even after installing the ``find_module`` shim above.
-    As a fallback we load the module manually via ``importlib`` and register it
-    inside ``sys.modules`` so the rest of the application can use it normally.
-    """
-
-    try:
-        import snscrape.modules.twitter as twitter_module  # type: ignore[import-not-found]
-    except AttributeError as exc:
-        if "find_module" not in str(exc):
-            raise
-
-        import sys
-        import types
-        from importlib.machinery import ModuleSpec
-        from pathlib import Path
-
-        modules_pkg_name = "snscrape.modules"
-        modules_pkg = sys.modules.get(modules_pkg_name)
-        modules_path = Path(snscrape.__file__).resolve().parent / "modules"
-
-        if modules_pkg is None:
-            modules_pkg = types.ModuleType(modules_pkg_name)
-            modules_pkg.__path__ = [str(modules_path)]  # type: ignore[attr-defined]
-            modules_pkg.__file__ = str(modules_path / "__init__.py")
-            modules_pkg.__package__ = modules_pkg_name
-            modules_pkg.__spec__ = ModuleSpec(modules_pkg_name, loader=None, is_package=True)
-            modules_pkg.__all__ = []  # type: ignore[attr-defined]
-            sys.modules[modules_pkg_name] = modules_pkg
-
-        spec = importlib.util.spec_from_file_location(
-            f"{modules_pkg_name}.twitter", modules_path / "twitter.py"
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError("Could not load snscrape.modules.twitter") from exc
-
-        twitter_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(twitter_module)
-
-        sys.modules[spec.name] = twitter_module
-        setattr(modules_pkg, "twitter", twitter_module)
-        all_attr = getattr(modules_pkg, "__all__", None)
-        if isinstance(all_attr, list) and "twitter" not in all_attr:
-            all_attr.append("twitter")
-    else:
-        return twitter_module
-
-    return twitter_module
-
-
-sntwitter = _import_snscrape_twitter()
-from flask import Flask, jsonify, render_template
-from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.feature_extraction.text import CountVectorizer
+import requests
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 
-MAX_TWEETS = 500
-REFRESH_WINDOW_MINUTES = 30
-
-# In-memory cache to avoid repeated scrapes when the data is still fresh.
-_data_cache: Dict[str, Any] = {"data": None, "timestamp": None}
-
-
-def _clean_text(text: str) -> str:
-    """Remove URLs, mentions, hashtags (symbol only) and collapse whitespace."""
-    text_no_urls = re.sub(r"https?://\S+", "", text)
-    text_no_handles = re.sub(r"@[A-Za-z0-9_]+", "", text_no_urls)
-    text_no_hash = text_no_handles.replace("#", "")
-    return re.sub(r"\s+", " ", text_no_hash).strip()
+POLYMARKET_BASE_URLS = (
+    "https://clob.polymarket.com/api",
+    "https://clob.polymarket.com",
+)
+REQUEST_TIMEOUT = 10
+ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
 
-def fetch_tweets(limit: int = MAX_TWEETS) -> pd.DataFrame:
-    """Fetch tweets from Elon Musk for the last six months using snscrape."""
-    six_months_ago = datetime.now(timezone.utc) - timedelta(days=182)
-    query = f"from:elonmusk since:{six_months_ago.date()}"
-    tweets: List[Dict[str, Any]] = []
+class PolymarketAPIError(RuntimeError):
+    """Raised when the Polymarket API cannot be reached or returns an error."""
 
-    scraper = sntwitter.TwitterSearchScraper(query)
-    for i, tweet in enumerate(scraper.get_items()):
-        if limit and i >= limit:
-            break
-        if tweet.date < six_months_ago:
-            break
-        tweets.append(
-            {
-                "id": tweet.id,
-                "date": tweet.date,
-                "content": tweet.rawContent,
-                "like_count": tweet.likeCount,
-                "reply_count": tweet.replyCount,
-                "retweet_count": tweet.retweetCount,
-                "quote_count": tweet.quoteCount,
-                "url": tweet.url,
-            }
+
+@dataclass
+class Position:
+    market_question: Optional[str]
+    market_slug: Optional[str]
+    outcome: Optional[str]
+    net_position: Optional[float]
+    average_price: Optional[float]
+    last_price: Optional[float]
+    value: Optional[float]
+    raw: Dict[str, Any]
+
+
+@dataclass
+class LimitOrder:
+    order_id: Optional[str]
+    market_question: Optional[str]
+    market_slug: Optional[str]
+    outcome: Optional[str]
+    side: Optional[str]
+    order_type: Optional[str]
+    price: Optional[float]
+    size: Optional[float]
+    remaining_size: Optional[float]
+    status: Optional[str]
+    created_at: Optional[str]
+    raw: Dict[str, Any]
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_market_question(payload: Dict[str, Any]) -> Optional[str]:
+    market = payload.get("market") or {}
+    return (
+        payload.get("marketQuestion")
+        or payload.get("question")
+        or market.get("question")
+        or market.get("title")
+        or market.get("name")
+    )
+
+
+def _extract_market_slug(payload: Dict[str, Any]) -> Optional[str]:
+    market = payload.get("market") or {}
+    return payload.get("marketSlug") or market.get("slug") or market.get("url")
+
+
+def _extract_outcome(payload: Dict[str, Any]) -> Optional[str]:
+    outcome = (
+        payload.get("outcome")
+        or payload.get("outcomeName")
+        or payload.get("token")
+        or payload.get("asset")
+    )
+
+    if outcome is not None:
+        return str(outcome)
+
+    market = payload.get("market") or {}
+    outcomes = market.get("outcomes")
+    if isinstance(outcomes, list):
+        idx = payload.get("outcomeIndex") or payload.get("outcome_id")
+        try:
+            if idx is not None:
+                idx_int = int(idx)
+                return str(outcomes[idx_int])
+        except (TypeError, ValueError, IndexError):
+            return None
+    return None
+
+
+def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:  # pragma: no cover - network dependent
+        logger.exception("Request to %s failed", url)
+        raise PolymarketAPIError("Unable to reach Polymarket API") from exc
+
+    if response.status_code != 200:
+        logger.error("Polymarket API error %s: %s", response.status_code, response.text)
+        raise PolymarketAPIError(
+            f"Polymarket API returned status {response.status_code}: {response.text.strip()}"
         )
-
-    if not tweets:
-        raise RuntimeError("No tweets were fetched. The scraper may be rate limited.")
-
-    df = pd.DataFrame(tweets)
-    df.sort_values("date", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-
-def build_topics(texts: List[str], n_topics: int = 5, n_words: int = 8) -> List[Dict[str, Any]]:
-    cleaned = [_clean_text(t) for t in texts if t.strip()]
-    if len(cleaned) < 5:
-        return []
-
-    vectorizer = CountVectorizer(
-        stop_words="english",
-        min_df=2,
-        max_df=0.9,
-    )
-    doc_term = vectorizer.fit_transform(cleaned)
-    if doc_term.shape[1] == 0:
-        return []
-
-    n_topics = min(n_topics, doc_term.shape[0])
-    lda = LatentDirichletAllocation(
-        n_components=n_topics,
-        learning_method="online",
-        random_state=42,
-        max_iter=10,
-    )
-    lda.fit(doc_term)
-
-    topics: List[Dict[str, Any]] = []
-    feature_names = vectorizer.get_feature_names_out()
-    for idx, topic in enumerate(lda.components_):
-        top_indices = topic.argsort()[::-1][:n_words]
-        top_words = [feature_names[i] for i in top_indices]
-        topics.append({"topic": idx + 1, "keywords": top_words})
-
-    return topics
-
-
-def summarize_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
-    df = df.copy()
-    df["length"] = df["content"].str.len()
-    df["clean_content"] = df["content"].apply(_clean_text)
-    df["created_at"] = pd.to_datetime(df["date"], utc=True)
-    df["hour"] = df["created_at"].dt.hour
-    df["date_only"] = df["created_at"].dt.date
-
-    bins = [0, 6, 12, 18, 24]
-    labels = ["Late Night", "Morning", "Afternoon", "Evening"]
-    df["time_of_day"] = pd.cut(df["hour"], bins=bins, labels=labels, right=False, include_lowest=True)
-
-    summary = {
-        "tweet_count": int(df.shape[0]),
-        "avg_length": float(df["length"].mean()),
-        "median_length": float(df["length"].median()),
-        "max_length": int(df["length"].max()),
-        "min_length": int(df["length"].min()),
-        "avg_likes": float(df["like_count"].mean()),
-        "avg_retweets": float(df["retweet_count"].mean()),
-    }
-
-    scatter = {
-        "timestamps": df["created_at"].dt.tz_convert("UTC").astype(str).tolist(),
-        "lengths": df["length"].tolist(),
-        "hover_text": [
-            f"{row.created_at:%Y-%m-%d %H:%M} UTC | {row.length} chars" for row in df.itertuples()
-        ],
-    }
-
-    daily = (
-        df.groupby("date_only")
-        .agg(
-            tweet_count=("id", "count"),
-            avg_length=("length", "mean"),
-            total_likes=("like_count", "sum"),
-        )
-        .reset_index()
-    )
-    daily["date_only"] = daily["date_only"].astype(str)
-
-    hourly = (
-        df.groupby("hour")
-        .agg(tweet_count=("id", "count"), avg_length=("length", "mean"))
-        .reset_index()
-        .sort_values("hour")
-    )
-
-    hourly["hour"] = hourly["hour"].astype(int)
-
-    time_of_day = (
-        df.groupby("time_of_day")
-        .agg(tweet_count=("id", "count"), avg_length=("length", "mean"))
-        .reset_index()
-    )
-
-    time_of_day["time_of_day"] = time_of_day["time_of_day"].astype(str)
-
-    hist_counts, hist_edges = np.histogram(df["length"], bins=15)
-    hist_centers = ((hist_edges[:-1] + hist_edges[1:]) / 2).tolist()
-
-    topics = build_topics(df["clean_content"].tolist())
-
-    top_examples = (
-        df.sort_values("like_count", ascending=False)
-        .head(5)[["created_at", "content", "like_count", "retweet_count", "reply_count", "url"]]
-    )
-    top_examples["created_at"] = top_examples["created_at"].dt.strftime("%Y-%m-%d %H:%M UTC")
-
-    dataset = {
-        "summary": summary,
-        "scatter": scatter,
-        "daily": daily.to_dict(orient="list"),
-        "hourly": hourly.to_dict(orient="list"),
-        "time_of_day": time_of_day.to_dict(orient="list"),
-        "length_hist": {
-            "counts": hist_counts.tolist(),
-            "bins": hist_centers,
-        },
-        "topics": topics,
-        "top_examples": top_examples.to_dict(orient="records"),
-    }
-    return dataset
-
-
-def load_data(force_refresh: bool = False) -> Dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    if not force_refresh and _data_cache["data"] is not None:
-        ts = _data_cache["timestamp"]
-        if ts and now - ts < timedelta(minutes=REFRESH_WINDOW_MINUTES):
-            return _data_cache["data"]
 
     try:
-        df = fetch_tweets()
-        dataset = summarize_dataframe(df)
-    except Exception as exc:  # pragma: no cover - network dependent
-        logger.exception("Failed to fetch tweets: %s", exc)
-        if _data_cache["data"] is not None and not force_refresh:
-            return _data_cache["data"]
-        raise RuntimeError(
-            "Unable to retrieve tweets at the moment. Try again later or use cached data if available."
-        ) from exc
+        return response.json()
+    except ValueError as exc:
+        logger.exception("Invalid JSON from %s", url)
+        raise PolymarketAPIError("Polymarket API returned invalid JSON") from exc
 
-    _data_cache["data"] = dataset
-    _data_cache["timestamp"] = now
-    return dataset
+
+def _parse_positions(payload: Dict[str, Any]) -> List[Position]:
+    raw_positions = payload.get("positions")
+    if raw_positions is None and isinstance(payload, dict):
+        # Some endpoints return the list directly without a wrapper key.
+        raw_positions = payload.get("data") or payload
+
+    positions: List[Position] = []
+    if isinstance(raw_positions, dict):
+        raw_positions = raw_positions.get("positions") or raw_positions.get("data")
+
+    if not isinstance(raw_positions, list):
+        return positions
+
+    for item in raw_positions:
+        if not isinstance(item, dict):
+            continue
+        positions.append(
+            Position(
+                market_question=_extract_market_question(item),
+                market_slug=_extract_market_slug(item),
+                outcome=_extract_outcome(item),
+                net_position=_coerce_float(
+                    item.get("netPosition")
+                    or item.get("net_position")
+                    or item.get("balance")
+                    or item.get("size")
+                ),
+                average_price=_coerce_float(
+                    item.get("averagePrice")
+                    or item.get("average_price")
+                    or item.get("avgPrice")
+                ),
+                last_price=_coerce_float(
+                    item.get("lastPrice")
+                    or item.get("last_price")
+                    or item.get("price")
+                ),
+                value=_coerce_float(
+                    item.get("value")
+                    or item.get("markToMarketValue")
+                    or item.get("mtmValue")
+                ),
+                raw=item,
+            )
+        )
+    return positions
+
+
+def _parse_orders(payload: Dict[str, Any]) -> List[LimitOrder]:
+    raw_orders = payload.get("orders")
+    if raw_orders is None and isinstance(payload, dict):
+        raw_orders = payload.get("data") or payload
+
+    if isinstance(raw_orders, dict):
+        raw_orders = raw_orders.get("orders") or raw_orders.get("data")
+
+    orders: List[LimitOrder] = []
+    if not isinstance(raw_orders, list):
+        return orders
+
+    for item in raw_orders:
+        if not isinstance(item, dict):
+            continue
+        orders.append(
+            LimitOrder(
+                order_id=str(item.get("id") or item.get("orderId") or item.get("order_id")),
+                market_question=_extract_market_question(item),
+                market_slug=_extract_market_slug(item),
+                outcome=_extract_outcome(item),
+                side=(item.get("side") or item.get("orderSide") or item.get("type")),
+                order_type=(item.get("orderType") or item.get("type") or item.get("kind")),
+                price=_coerce_float(item.get("price") or item.get("limitPrice") or item.get("avg_price")),
+                size=_coerce_float(
+                    item.get("size")
+                    or item.get("originalSize")
+                    or item.get("original_size")
+                    or item.get("quantity")
+                ),
+                remaining_size=_coerce_float(
+                    item.get("remainingSize")
+                    or item.get("remaining_size")
+                    or item.get("leavesQuantity")
+                ),
+                status=item.get("status"),
+                created_at=item.get("created_at")
+                or item.get("createdAt")
+                or item.get("timestamp"),
+                raw=item,
+            )
+        )
+    return orders
+
+
+def _position_urls(address: str) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    for base in POLYMARKET_BASE_URLS:
+        base = base.rstrip("/")
+        for suffix in (
+            f"/polygon/wallets/{address}/positions",
+            f"/wallets/{address}/positions",
+        ):
+            url = f"{base}{suffix}"
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
+def fetch_wallet_positions(address: str) -> List[Position]:
+    last_not_found: Optional[PolymarketAPIError] = None
+    for url in _position_urls(address):
+        try:
+            payload = _fetch_json(url)
+        except PolymarketAPIError as exc:
+            message = str(exc)
+            if "status 404" in message:
+                last_not_found = exc
+                continue
+            raise
+        return _parse_positions(payload)
+
+    if last_not_found is not None:
+        raise PolymarketAPIError(
+            "Unable to locate a wallet positions endpoint on Polymarket."
+        ) from last_not_found
+
+    return []
+
+
+def fetch_wallet_orders(address: str) -> List[LimitOrder]:
+    query_variants = (
+        {"wallet": address, "status": "OPEN", "limit": 200},
+        {"walletAddress": address, "status": "OPEN", "limit": 200},
+        {"maker": address, "status": "OPEN", "limit": 200},
+    )
+
+    last_error: Optional[PolymarketAPIError] = None
+    for base in POLYMARKET_BASE_URLS:
+        url = f"{base.rstrip('/')}/orders"
+        for params in query_variants:
+            try:
+                payload = _fetch_json(url, params=params)
+            except PolymarketAPIError as exc:
+                message = str(exc)
+                if "status 404" in message:
+                    last_error = exc
+                    continue
+                raise
+
+            orders = _parse_orders(payload)
+            # If the endpoint is valid it will include an orders key even if empty.
+            raw_orders = None
+            if isinstance(payload, dict):
+                raw_orders = payload.get("orders") or payload.get("data")
+            if raw_orders is not None:
+                return orders
+
+    if last_error is not None:
+        raise PolymarketAPIError(
+            "Unable to locate an orders endpoint for the provided wallet."
+        ) from last_error
+
+    return []
+
+
+def normalize_addresses(addresses: List[str]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for raw in addresses:
+        if not isinstance(raw, str):
+            continue
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        candidate = candidate.lower()
+        if not ADDRESS_RE.match(candidate):
+            raise ValueError(f"Invalid Polygon wallet address: {raw}")
+        if candidate not in seen:
+            seen.add(candidate)
+            normalized.append(candidate)
+    return normalized
 
 
 @app.route("/")
@@ -293,27 +310,42 @@ def index() -> str:
     return render_template("index.html")
 
 
-@app.route("/data")
-def get_data():
+@app.route("/api/wallets", methods=["POST"])
+def wallet_snapshot():
     try:
-        dataset = load_data()
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
-    timestamp = _data_cache["timestamp"]
-    iso_ts = timestamp.isoformat() if timestamp else None
-    return jsonify({"data": dataset, "last_updated": iso_ts})
+        payload = request.get_json(force=True)
+    except Exception as exc:  # pragma: no cover - request dependent
+        logger.exception("Invalid JSON payload: %s", exc)
+        return jsonify({"error": "Request body must be valid JSON."}), 400
 
+    addresses = payload.get("addresses") if isinstance(payload, dict) else None
+    if not isinstance(addresses, list):
+        return jsonify({"error": "`addresses` must be a list of wallet addresses."}), 400
 
-@app.route("/refresh", methods=["POST"])
-def refresh_data():
     try:
-        dataset = load_data(force_refresh=True)
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
-    timestamp = _data_cache["timestamp"]
-    iso_ts = timestamp.isoformat() if timestamp else None
-    return jsonify({"status": "ok", "data": dataset, "last_updated": iso_ts})
+        normalized = normalize_addresses(addresses)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    if not normalized:
+        return jsonify({"error": "Provide at least one valid Polygon wallet address."}), 400
+
+    results = []
+    for address in normalized:
+        wallet_data: Dict[str, Any] = {"address": address}
+        try:
+            wallet_data["positions"] = [position.__dict__ for position in fetch_wallet_positions(address)]
+            wallet_data["open_orders"] = [order.__dict__ for order in fetch_wallet_orders(address)]
+        except PolymarketAPIError as exc:
+            wallet_data["error"] = str(exc)
+        results.append(wallet_data)
+
+    response = {
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "results": results,
+    }
+    return jsonify(response)
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == "__main__":  # pragma: no cover - manual execution
+    app.run(host="0.0.0.0", port=3000, debug=True)
