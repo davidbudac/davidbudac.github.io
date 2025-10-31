@@ -12,7 +12,10 @@ from flask import Flask, jsonify, render_template, request
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 
-POLYMARKET_BASE_URL = "https://clob.polymarket.com/api"
+POLYMARKET_BASE_URLS = (
+    "https://clob.polymarket.com/api",
+    "https://clob.polymarket.com",
+)
 REQUEST_TIMEOUT = 10
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
@@ -108,7 +111,7 @@ def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
     if response.status_code != 200:
         logger.error("Polymarket API error %s: %s", response.status_code, response.text)
         raise PolymarketAPIError(
-            f"Polymarket API returned status {response.status_code}: {response.text}"
+            f"Polymarket API returned status {response.status_code}: {response.text.strip()}"
         )
 
     try:
@@ -211,17 +214,77 @@ def _parse_orders(payload: Dict[str, Any]) -> List[LimitOrder]:
     return orders
 
 
+def _position_urls(address: str) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    for base in POLYMARKET_BASE_URLS:
+        base = base.rstrip("/")
+        for suffix in (
+            f"/polygon/wallets/{address}/positions",
+            f"/wallets/{address}/positions",
+        ):
+            url = f"{base}{suffix}"
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
 def fetch_wallet_positions(address: str) -> List[Position]:
-    url = f"{POLYMARKET_BASE_URL}/polygon/wallets/{address}/positions"
-    payload = _fetch_json(url)
-    return _parse_positions(payload)
+    last_not_found: Optional[PolymarketAPIError] = None
+    for url in _position_urls(address):
+        try:
+            payload = _fetch_json(url)
+        except PolymarketAPIError as exc:
+            message = str(exc)
+            if "status 404" in message:
+                last_not_found = exc
+                continue
+            raise
+        return _parse_positions(payload)
+
+    if last_not_found is not None:
+        raise PolymarketAPIError(
+            "Unable to locate a wallet positions endpoint on Polymarket."
+        ) from last_not_found
+
+    return []
 
 
 def fetch_wallet_orders(address: str) -> List[LimitOrder]:
-    url = f"{POLYMARKET_BASE_URL}/orders"
-    params = {"wallet": address, "status": "OPEN", "limit": 200}
-    payload = _fetch_json(url, params=params)
-    return _parse_orders(payload)
+    query_variants = (
+        {"wallet": address, "status": "OPEN", "limit": 200},
+        {"walletAddress": address, "status": "OPEN", "limit": 200},
+        {"maker": address, "status": "OPEN", "limit": 200},
+    )
+
+    last_error: Optional[PolymarketAPIError] = None
+    for base in POLYMARKET_BASE_URLS:
+        url = f"{base.rstrip('/')}/orders"
+        for params in query_variants:
+            try:
+                payload = _fetch_json(url, params=params)
+            except PolymarketAPIError as exc:
+                message = str(exc)
+                if "status 404" in message:
+                    last_error = exc
+                    continue
+                raise
+
+            orders = _parse_orders(payload)
+            # If the endpoint is valid it will include an orders key even if empty.
+            raw_orders = None
+            if isinstance(payload, dict):
+                raw_orders = payload.get("orders") or payload.get("data")
+            if raw_orders is not None:
+                return orders
+
+    if last_error is not None:
+        raise PolymarketAPIError(
+            "Unable to locate an orders endpoint for the provided wallet."
+        ) from last_error
+
+    return []
 
 
 def normalize_addresses(addresses: List[str]) -> List[str]:
@@ -285,4 +348,4 @@ def wallet_snapshot():
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=3000, debug=True)
